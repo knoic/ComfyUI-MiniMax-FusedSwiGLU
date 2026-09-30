@@ -3,7 +3,7 @@ import torch
 
 import comfy.ops
 import comfy.quant_ops
-from .fused_swiglu import triton_swiglu, HAS_TRITON
+from .fused_swiglu import triton_swiglu, triton_addcmul_, HAS_TRITON
 
 log = logging.getLogger("MiniMax-FusedSwiGLU")
 
@@ -196,9 +196,13 @@ def _mod_scale_shift(h, shift, scale, segments):
     return h
 
 
-def _mod_gate(x, gate, other, segments):
+def _mod_gate(x, gate, other, segments, use_triton=True):
     for a, b, row in segments:
-        x[a:b].addcmul_(other[a:b], _mod_row(gate, row, x.dtype))
+        g = _mod_row(gate, row, x.dtype)
+        if use_triton and HAS_TRITON:
+            triton_addcmul_(x[a:b], other[a:b], g)
+        else:
+            x[a:b].addcmul_(other[a:b], g)
     return x
 
 
@@ -247,7 +251,7 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                     row_is_tensor = True
                 else:
                     row_is_tensor = False
-                    r_scale = scale_mlp[row].to(x.dtype)
+                    r_scale = 1.0 + scale_mlp[row].to(x.dtype)
                     r_shift = shift_mlp[row].to(x.dtype)
                     r_gate = gate_mlp[row].to(x.dtype)
 
@@ -261,7 +265,7 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                     # 2. Slice row modulation
                     if row_is_tensor:
                         r = row[offset - a : end - a]
-                        s_mod = scale_mlp[r].to(x.dtype)
+                        s_mod = 1.0 + scale_mlp[r].to(x.dtype)
                         sh_mod = shift_mlp[r].to(x.dtype)
                         g_mod = gate_mlp[r].to(x.dtype)
                     else:
@@ -269,7 +273,7 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                         sh_mod = r_shift
                         g_mod = r_gate
 
-                    chunk_h.mul_(1.0 + s_mod).add_(sh_mod)
+                    chunk_h.mul_(s_mod).add_(sh_mod)
 
                     # 3. FlashMLP in INT8 (Zero-HBM write)
                     proj1 = comfy.quant_ops.ck.int8_linear(
@@ -286,7 +290,10 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                     del proj1
 
                     # 4. In-place gated residual accumulation into chunk_x
-                    chunk_x.addcmul_(mlp_res, g_mod)
+                    if use_triton and HAS_TRITON:
+                        triton_addcmul_(chunk_x, mlp_res, g_mod)
+                    else:
+                        chunk_x.addcmul_(mlp_res, g_mod)
                     del mlp_res
         else:
             w2_t = w2.t()
@@ -295,7 +302,7 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                     row_is_tensor = True
                 else:
                     row_is_tensor = False
-                    r_scale = scale_mlp[row].to(x.dtype)
+                    r_scale = 1.0 + scale_mlp[row].to(x.dtype)
                     r_shift = shift_mlp[row].to(x.dtype)
                     r_gate = gate_mlp[row].to(x.dtype)
 
@@ -307,7 +314,7 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
 
                     if row_is_tensor:
                         r = row[offset - a : end - a]
-                        s_mod = scale_mlp[r].to(x.dtype)
+                        s_mod = 1.0 + scale_mlp[r].to(x.dtype)
                         sh_mod = shift_mlp[r].to(x.dtype)
                         g_mod = gate_mlp[r].to(x.dtype)
                     else:
@@ -315,7 +322,7 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                         sh_mod = r_shift
                         g_mod = r_gate
 
-                    chunk_h.mul_(1.0 + s_mod).add_(sh_mod)
+                    chunk_h.mul_(s_mod).add_(sh_mod)
 
                     proj1 = torch.nn.functional.linear(chunk_h, w1, b1)
                     del chunk_h
@@ -333,7 +340,10 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
                         mlp_res = mlp_res + b2
                     del mid
 
-                    chunk_x.addcmul_(mlp_res, g_mod)
+                    if use_triton and HAS_TRITON:
+                        triton_addcmul_(chunk_x, mlp_res, g_mod)
+                    else:
+                        chunk_x.addcmul_(mlp_res, g_mod)
                     del mlp_res
 
     if len(orig_shape) > 2:
@@ -361,7 +371,7 @@ def _make_e2e_block_patch(block, tile_size, use_triton):
         h = _mod_scale_shift(block.norm1(x), shift_msa, scale_msa, mod_segments)
         attn_out = attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options)
         del h
-        x = _mod_gate(x, gate_msa, attn_out, mod_segments)
+        x = _mod_gate(x, gate_msa, attn_out, mod_segments, use_triton=use_triton)
         del attn_out
 
         # 2. Technology 1: End-to-End Micro-Tile DiT Pipeline (Norm2 + AdaLN + FlashMLP + Gate Add)

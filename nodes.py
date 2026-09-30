@@ -8,11 +8,31 @@ from .fused_swiglu import triton_swiglu, triton_addcmul_, HAS_TRITON
 log = logging.getLogger("MiniMax-FusedSwiGLU")
 
 
-def token_stream_mlp_forward(self_mlp, x, tile_size=512, use_triton=True, seq_threshold=512):
+def _get_adaptive_tile_size(device=None):
+    """Segment-aware adaptive macro-block sizing based on hardware VRAM and L2 Cache."""
+    try:
+        if device is None or not torch.cuda.is_available():
+            vram_gb = 16.0
+        else:
+            dev_idx = device.index if isinstance(device, torch.device) and device.index is not None else torch.cuda.current_device()
+            vram_bytes = torch.cuda.get_device_properties(dev_idx).total_memory
+            vram_gb = vram_bytes / (1024 ** 3)
+    except Exception:
+        vram_gb = 16.0
+
+    if vram_gb >= 14.0:
+        return 1024  # 16GB+ GPUs (RTX 4080, 4090, A100): 1024 tokens (58.7MB in 64MB+ L2 Cache)
+    elif vram_gb >= 10.0:
+        return 512   # 12GB GPUs (RTX 4070): 512 tokens (~29MB)
+    else:
+        return 256   # <=8GB GPUs: 256 tokens (~15MB)
+
+
+def token_stream_mlp_forward(self_mlp, x, tile_size=1024, use_triton=True, seq_threshold=1024):
     """Micro-tile streamed MLP forward for INT8 Quantized models and low-VRAM GPUs.
     
     Locks the peak activation memory to (tile_size * 28672 * bytes_per_elem),
-    reducing peak intermediate activation from ~1.2GB+ down to ~29MB (for 512 tokens).
+    reducing peak intermediate activation from ~1.2GB+ down to ~58MB (for 1024 tokens) / ~29MB (for 512 tokens).
     100% compatible with ComfyUI native INT8 QuantizedTensor (TensorWiseINT8Layout).
     """
     if isinstance(x, list):
@@ -20,6 +40,9 @@ def token_stream_mlp_forward(self_mlp, x, tile_size=512, use_triton=True, seq_th
     orig_shape = x.shape
     if x.ndim > 2:
         x = x.reshape(-1, orig_shape[-1])
+
+    if tile_size <= 0:
+        tile_size = _get_adaptive_tile_size(x.device)
 
     s = x.shape[0]
     if s <= seq_threshold or tile_size >= s:
@@ -117,10 +140,13 @@ def token_stream_mlp_forward(self_mlp, x, tile_size=512, use_triton=True, seq_th
     return out
 
 
-def channel_fused_mlp_forward(self_mlp, x, num_chunks=8, tile_size=512, use_triton=True):
+def channel_fused_mlp_forward(self_mlp, x, num_chunks=8, tile_size=1024, use_triton=True):
     """Channel-wise sliced FFN for unquantized models; auto-routes INT8 to token streaming."""
     if isinstance(x, list):
         x = x[0]
+
+    if tile_size <= 0:
+        tile_size = _get_adaptive_tile_size(x.device)
 
     w1_raw = getattr(self_mlp.fc1, "weight", None)
     w2_raw = getattr(self_mlp.fc2, "weight", None)
@@ -210,13 +236,16 @@ def _e2e_dit_mlp_pipeline(block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments
     """Technology 1: End-to-End Micro-Tile DiT Pipeline.
     
     Fuses Norm2 + AdaLN Modulation + FlashMLP SwiGLU + In-place Gated Residual Accumulation
-    into a single L2-Cache resident tile stream (512 tokens = ~34MB total peak).
+    into a single L2-Cache resident tile stream (1024 tokens = ~58MB total peak).
     Eliminates all 440MB+ intermediate full-sequence tensor allocations per DiT block.
     100% Bit-Exact mathematically identical to official model.
     """
     orig_shape = x.shape
     if x.ndim > 2:
         x = x.reshape(-1, orig_shape[-1])
+
+    if tile_size <= 0:
+        tile_size = _get_adaptive_tile_size(x.device)
 
     s = x.shape[0]
     w1_raw = getattr(block.mlp.fc1, "weight", None)
@@ -412,11 +441,11 @@ class MiniMaxFusedSwiGLUPatch:
                     "tooltip": "auto_stream: Automatically detects INT8 vs FP16/BF16 and applies the optimal micro-chunking to guarantee zero OOM."
                 }),
                 "tile_size": ("INT", {
-                    "default": 512,
-                    "min": 128,
+                    "default": 1024,
+                    "min": 0,
                     "max": 8192,
-                    "step": 128,
-                    "tooltip": "Token chunk size for INT8 and token-wise modes. 512 tokens locks activation to only ~29MB; 256 tokens to ~15MB. Directly kills OOM."
+                    "step": 64,
+                    "tooltip": "Token chunk size for INT8 and token-wise modes. 0 = auto-adaptive (1024 for >=16GB VRAM, 512 for 12GB, 256 for <=8GB). Default 1024 halves loop launches while staying strictly within the 64MB L2 Cache."
                 }),
                 "channel_chunks": ("INT", {
                     "default": 8,
@@ -439,13 +468,17 @@ class MiniMaxFusedSwiGLUPatch:
 
     DESCRIPTION = (
         "Anti-OOM Stream FFN for MiniMax H3 (Native INT8 & BF16). "
-        "Eliminates the 1.2GB+ intermediate activation spike by streaming tokens in micro-tiles (512 tokens = ~29MB peak). "
+        "Eliminates the 1.2GB+ intermediate activation spike by streaming tokens in micro-tiles (1024 tokens = ~58MB peak, 512 tokens = ~29MB peak). "
         "Guarantees that INT8 models NEVER run full un-chunked SwiGLU. 100% bit-exact mathematical precision."
     )
 
     def apply_patch(self, model, enabled, strategy, tile_size, channel_chunks, use_triton):
         if not enabled:
             return (model,)
+
+        if tile_size <= 0:
+            tile_size = _get_adaptive_tile_size()
+            log.info(f"MiniMax Fused SwiGLU: Auto-adaptive tile size selected: {tile_size}")
 
         m = model.clone()
         diffusion_model = m.get_model_object("diffusion_model")

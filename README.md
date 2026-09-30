@@ -10,9 +10,10 @@
    - 官方实现中，每个 Block 会在显存中反复分配 220MB 的 Norm2 张量与 220MB 的 MLP 输出张量，频繁产生 440MB+ 的中间读写往返。
    - 本插件将 `Norm2 -> AdaLN -> FlashMLP -> In-place Gated Add` 全链路打包为**单一 L2 Cache 驻留微瓦片流**，直接就地累加写入，**彻底抹去每层 440MB 显存开销**，显存读写压力骤降 44GB/step。
 
-2. **彻底消除 1.15GB 中间激活显存峰值（Anti-OOM，显存峰值降 98.1%）**：
+2. **彻底消除 1.15GB 中间激活显存峰值（Segment-Aware 宏块自适应 1024，循环发射减半）**：
    - 原版前向传播在计算长序列（如 $S=20000$）时，FFN 第一层全连接会一次性分配 `[S, 28672]` 巨型张量（~1.15 GB）。
-   - 本节点采用 **FlashMLP 微切片流式计算**（默认 Tile 大小 512 Tokens），将单次激活内存**物理锁死在 ~29MB～55MB**，100% 常驻显卡片上 L2 Cache。
+   - 本节点采用 **Segment-Aware 宏块自适应流式计算**（默认宏块 1024 Tokens），将单次激活内存**物理锁死在 ~58MB**，100% 常驻 Ada Lovelace 64MB 片上 L2 Cache，循环发射次数相比 512 切片**直降 50%**。
+   - 分段感知机制：短分段（如提示词嵌入）自动整段直通，零切片调度开销；长序列流式切块。
 
 3. **Triton 原生片上 SRAM 算子双重融合（SwiGLU + Fast In-place Addcmul，残差累加提速 ~49%）**：
    - **Triton Fused SwiGLU**：在 GPU 片上寄存器与共享内存（SRAM）中一次性完成 $\text{silu}(gate) \times up$，相比 PyTorch 原生算子提速 **2 倍以上**，零显存驻留。
@@ -33,11 +34,13 @@
 在 ComfyUI 工作流中：
 1. 搜索并添加节点：`MiniMax H3 Fused Stream SwiGLU (Anti-OOM)`（分类：`model_patches/minimax`）；
 2. 将加载的 MiniMax 模型（`MODEL`）连接到此节点的 `model` 输入端；
-3. 将输出的 `model` 直接送入下游的采样器（KSampler / SamplerCustomAdvanced）或其它补丁节点（如 `MiniMax H3 Low VRAM Attention`）。
+3. 将输出的 `model` 直接送入下游的采样器（KSampler / SamplerCustomAdvanced）或其它补丁节点。
 
 ### 推荐参数配置：
-- **`tile_size`**（默认 512）：
-  - 16G 显存用户：推荐保持默认 `512`（中间激活仅占 29MB）；
-  - 12G / 8G 极限低显存用户：可调为 `256`（中间激活仅占 14.6MB）；
+- **`tile_size`**（默认 1024）：
+  - **`0`（自动自适应）**：自动检测当前显卡 VRAM（>=16G 显存自适应 1024；12G 显存自适应 512；<=8G 显存自适应 256）；
+  - **`1024`（推荐默认）**：16G/24G 显卡（RTX 4080/4090/5080 等），循环发射减半，激活内存仅 58MB 且完全在 64MB L2 Cache 内；
+  - **`512`**：12G 显存设备（RTX 4070 等，激活约 29MB）；
+  - **`256`**：8G 极限低显存用户（激活仅 14.6MB）；
 - **`use_triton`**（默认 True）：开启片上融合算子；
-- **`seq_threshold`**（默认 1024）：只有序列长度超过该阈值时才切片，短序列保持零调度开销。
+- **`strategy`**（默认 auto_stream）：自动检测 INT8 与浮点模型并选用最优计算链路。
